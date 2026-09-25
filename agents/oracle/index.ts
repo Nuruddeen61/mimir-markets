@@ -44,8 +44,6 @@
  * ORACLE_POLL_INTERVAL_MS=60000 (poll cadence in ms, default 60s)
  */
 
-applyWorkerGeminiKey("ORACLE_GEMINI_API_KEY");
-
 import { requireEnv, requireAnyLLMKey, applyWorkerGeminiKey, createThrottle } from "../../lib/agent-bootstrap";
 import { kellyFraction } from "../../lib/kelly";
 import { type VerdictPayload } from "../../lib/verdict";
@@ -97,6 +95,8 @@ import {
 import { normalizeQuorum } from "../../lib/council/quorum";
 import { checkRiskBounds, isStakeAllowed } from "../../lib/oracle-risk";
 
+applyWorkerGeminiKey("ORACLE_GEMINI_API_KEY");
+
 // ── Config ────────────────────────────────────────────────────────────────────
 const POLL_INTERVAL_MS = Number(process.env.ORACLE_POLL_INTERVAL_MS?? "60000");
 const MAX_CONTENT_CHARS = 8_000;
@@ -122,7 +122,7 @@ const SETTLEMENT_DELAY_MS = Number(process.env.ORACLE_SETTLEMENT_DELAY_MS?? "900
 
 const llmGate = createThrottle(LLM_THROTTLE_MS);
 async function throttledLLM(
- ...args: Parameters<typeof callLLM>
+...args: Parameters<typeof callLLM>
 ): Promise<string> {
   await llmGate();
   return callLLM(...args);
@@ -167,12 +167,12 @@ async function fetchEvidence(claim: ClaimOnChain): Promise<EvidenceResult> {
   const budgetUsdc = evidenceBudgetUsdc(claim);
   const maxUnits = usdcToUnits(budgetUsdc);
   const paidFetch = PAY_EVIDENCE
-   ? async (u: string, init?: RequestInit) => {
+  ? async (u: string, init?: RequestInit) => {
         const r = await fetchWithBudget(u, ORACLE_PAYER, maxUnits, init);
         return {
           response: r.response,
           payment: r.payment
-           ? {
+          ? {
                 priceUnits: r.payment.priceUnits.toString(),
                 txHash: r.payment.txHash,
               }
@@ -196,7 +196,7 @@ async function fetchEvidence(claim: ClaimOnChain): Promise<EvidenceResult> {
     };
   } catch (err: any) {
     const msg = err instanceof EvidenceFetchError
-     ? err.message
+    ? err.message
       : (err?.message?? "unknown");
     return { text: `(Failed to fetch: ${msg})`, fetcher: "none" };
   }
@@ -211,7 +211,7 @@ async function evaluateClaim(
   const nowDate = new Date().toISOString();
   const potUsdc = claim.total_pot;
   const jurySection = jurorHistory.length > 0
-   ? `\n## Council juror reports (sequential, most recent last)\n${fenceUntrusted("juror-reports", jurorHistory.map((r, i) => `${i + 1}. ${r}`).join("\n"))}\n\nTreat these as other jurors' opinions, not primary evidence. Weigh them against the fetched evidence; you may agree, dissent, or discount them.\n`
+  ? `\n## Council juror reports (sequential, most recent last)\n${fenceUntrusted("juror-reports", jurorHistory.map((r, i) => `${i + 1}. ${r}`).join("\n"))}\n\nTreat these as other jurors' opinions, not primary evidence. Weigh them against the fetched evidence; you may agree, dissent, or discount them.\n`
     : "";
   const claimBlock = fenceUntrusted("claim", [
     `Question: ${claim.question}`,
@@ -291,7 +291,7 @@ function tierVerdict(verdict: OracleVerdict): OracleVerdict {
   if (verdict.confidence >= CONFIDENCE_HIGH_MIN) return verdict;
   if (verdict.confidence >= CONFIDENCE_MED_MIN) {
     return {
-     ...verdict,
+    ...verdict,
       explanation: `[CONTESTED] ${verdict.explanation}`.slice(0, 500),
     };
   }
@@ -313,7 +313,7 @@ function applyFetcherTrust(
   const cappedConfidence = Math.min(verdict.confidence, MAX_CONFIDENCE_NON_API);
   const tag = fetcher === "jina"? "[via-jina]" : fetcher === "direct"? "[via-scrape]" : "[no-fetch]";
   return {
-   ...verdict,
+  ...verdict,
     confidence: cappedConfidence,
     explanation: `${tag} ${verdict.explanation}`.slice(0, 500),
   };
@@ -388,8 +388,8 @@ async function settle(claim: ClaimOnChain): Promise<boolean> {
       capUsdc: COUNCIL_VOTE_CAP,
       quorum: COUNCIL_QUORUM,
       claimState: claim.state,
-     ...(COUNCIL_SELF_RESOLVING
-       ? { selfResolving: { alpha: COUNCIL_ALPHA, minVotes: COUNCIL_QUORUM } }
+    ...(COUNCIL_SELF_RESOLVING
+      ? { selfResolving: { alpha: COUNCIL_ALPHA, minVotes: COUNCIL_QUORUM } }
         : {}),
     }).catch((err) => {
       console.warn(`[settle] council vote failed, falling back to solo:`, err instanceof Error? err.message : err);
@@ -408,8 +408,8 @@ async function settle(claim: ClaimOnChain): Promise<boolean> {
         qChain: council.qHistory?? [],
         referenceQ: Number(referenceQ.toFixed(4)),
         scores: council.votes
-         .filter((v) => v.probability!== undefined)
-         .map((v) => Number((v.score?? 0).toFixed(4))),
+        .filter((v) => v.probability!== undefined)
+        .map((v) => Number((v.score?? 0).toFixed(4))),
       };
       bonusVotes = council.votes;
     } else if (council) {
