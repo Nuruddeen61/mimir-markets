@@ -645,6 +645,34 @@ const SCHEMA_STATEMENTS: SqlStatement[] = [
     updated_at BIGINT NOT NULL,
     UNIQUE(basket_id, source_block)
   )` },
+  /**
+   * Append-only ownership transfer log for user_baskets.
+   *
+   * The transfer row is written ATOMICALLY with the owner update (same
+   * transaction in transferBasket), so the audit trail can never fall out of
+   * sync with the live row. Rows are never deleted or updated.
+   *
+   * from_wallet / to_wallet are stored verbatim — Stellar strkeys are
+   * case-sensitive base32, and lowercasing them would corrupt the address.
+   */
+  { sql: `CREATE TABLE IF NOT EXISTS basket_ownership_transfers (
+    transfer_id TEXT PRIMARY KEY,
+    basket_id TEXT NOT NULL,
+    from_wallet TEXT NOT NULL,
+    to_wallet TEXT NOT NULL,
+    transferred_at BIGINT NOT NULL,
+    /**
+     * Client-generated nonce from the signed transfer message. UNIQUE enforces
+     * that the same signed authorisation cannot be submitted twice — even if
+     * ownership later cycles back to the original wallet, the old nonce is
+     * permanently consumed. Mirrors the agent_api_nonces pattern.
+     */
+    nonce TEXT NOT NULL,
+    UNIQUE(nonce)
+  )` },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_basket_transfers_basket ON basket_ownership_transfers(basket_id, transferred_at DESC)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_basket_transfers_from ON basket_ownership_transfers(from_wallet)" },
+  { sql: "CREATE INDEX IF NOT EXISTS idx_basket_transfers_to ON basket_ownership_transfers(to_wallet)" },
   {
     sql: "INSERT INTO schema_migrations(migration_id, schema_version, checksum, applied_at) VALUES($1, $2, $3, $4) ON CONFLICT(schema_version) DO NOTHING",
     args: ["base-platform-schema-v2", 2, "market-series-profile-conviction-baskets-v2", 0],
@@ -2482,4 +2510,103 @@ export async function listBasketSubscriptions(subscriber: string): Promise<strin
     args: [subscriber],
   });
   return result.rows.map((row) => getString((row as Record<string, unknown>).basket_id));
+}
+
+// ── Basket ownership transfers ────────────────────────────────────────────────
+
+export interface BasketOwnershipTransfer {
+  transferId: string;
+  basketId: string;
+  fromWallet: string;
+  toWallet: string;
+  transferredAt: number;
+  /** The client-supplied nonce that was consumed for this transfer. */
+  nonce: string;
+}
+
+/**
+ * Atomically update creator_wallet and write an audit row.
+ *
+ * The update and insert run in a single transaction so the audit trail can
+ * never diverge from the live owner. Both wallet values are stored verbatim:
+ * Stellar strkeys are case-sensitive base32, and lowercasing them would
+ * produce strings that match nothing stored.
+ *
+ * Returns false if `fromWallet` no longer matches the row (concurrent transfer
+ * or stale client), so the caller can surface a clear conflict error rather
+ * than a generic 500.
+ *
+ * The nonce is stored with a UNIQUE constraint. If the same signed payload is
+ * submitted twice — or if ownership cycles back and an old signature is
+ * replayed — the INSERT throws a unique-constraint violation and the
+ * transaction rolls back, causing this function to throw. The caller (the
+ * PATCH route) catches that as a 409 conflict, distinct from the false return
+ * which means "owner mismatch at UPDATE time".
+ */
+export async function transferBasket(args: {
+  transferId: string;
+  basketId: string;
+  fromWallet: string;
+  toWallet: string;
+  nonce: string;
+  at: number;
+}): Promise<boolean> {
+  const pool = await getDb();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Conditional update: only touches the row when the current owner still
+    // matches. RETURNING lets us detect whether the update actually fired.
+    const update = await client.query(
+      toPg(`UPDATE user_baskets SET creator_wallet = ?
+        WHERE basket_id = ? AND creator_wallet = ?
+        RETURNING basket_id`),
+      [args.toWallet, args.basketId, args.fromWallet],
+    );
+    if (update.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return false; // basket not found, or currentOwner no longer matches
+    }
+
+    // The UNIQUE(nonce) constraint here is the replay guard: inserting a nonce
+    // that already exists throws, rolls the transaction back, and the caller
+    // surfaces it as a conflict. This is the same atomic pattern as
+    // consumeAgentNonce / agent_api_nonces.
+    await client.query(
+      toPg(`INSERT INTO basket_ownership_transfers
+        (transfer_id, basket_id, from_wallet, to_wallet, transferred_at, nonce)
+        VALUES (?, ?, ?, ?, ?, ?)`),
+      [args.transferId, args.basketId, args.fromWallet, args.toWallet, args.at, args.nonce],
+    );
+
+    await client.query("COMMIT");
+    return true;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** Full transfer history for a basket, newest first. */
+export async function getBasketTransferHistory(basketId: string): Promise<BasketOwnershipTransfer[]> {
+  const pool = await getDb();
+  const result = await execute(pool, {
+    sql: `SELECT * FROM basket_ownership_transfers
+      WHERE basket_id = ? ORDER BY transferred_at DESC`,
+    args: [basketId],
+  });
+  return result.rows.map((raw) => {
+    const row = raw as Record<string, unknown>;
+    return {
+      transferId: getString(row.transfer_id),
+      basketId: getString(row.basket_id),
+      fromWallet: getString(row.from_wallet),
+      toWallet: getString(row.to_wallet),
+      transferredAt: getNumber(row.transferred_at),
+      nonce: getString(row.nonce),
+    };
+  });
 }

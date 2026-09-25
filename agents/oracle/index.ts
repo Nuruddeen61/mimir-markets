@@ -562,10 +562,7 @@ async function poll(): Promise<void> {
       console.error(`[oracle] Error on claim ${id}:`, err);
     }
   }
-  if (expiredActive.length > 0 && isPaused("oracle_settlement")) {
-    console.warn(`[oracle] Settlement is paused — ${expiredActive.length} expired claim(s) wait for the next poll.`);
-    expiredActive.length = 0;
-  }
+
   expiredActive.sort((a, b) => a.deadline - b.deadline);
   for (let i = 0; i < expiredActive.length; i++) {
     const claim = expiredActive[i];

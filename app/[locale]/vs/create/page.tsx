@@ -15,6 +15,7 @@ import { StrKey } from "@stellar/stellar-sdk";
 import { useLocale, useMessages, useTranslations } from "next-intl";
 import { usePathname, useRouter } from "@/i18n/navigation";
 import { useWallet } from "@/lib/wallet";
+import { evaluateUsdcTrustlineGate } from "@/lib/usdcTrustlineGate";
 import {
   createClaim,
   createRematch,
@@ -82,6 +83,10 @@ import {
 import { toast } from "sonner";
 import PageTransition, { AnimatedItem } from "@/components/PageTransition";
 import { GlassCard, Button, Input, ListboxField } from "@/components/ui";
+import {
+  UsdcTrustlineGate,
+  useUsdcTrustline,
+} from "@/components/wallet/UsdcTrustlineGate";
 import ClaimStrengthCard from "@/components/ClaimStrengthCard";
 import CreateChallengeTicket from "@/components/vs/CreateChallengeTicket";
 import {
@@ -192,7 +197,9 @@ export default function CreatePage() {
   const router = useRouter();
   const pathname = usePathname();
   const { address, isConnected, connect, signer } = useWallet();
+  const trustline = useUsdcTrustline();
   const t = useTranslations("create");
+  const tWallet = useTranslations("wallet");
   const tc = useTranslations("common");
   const tQuality = useTranslations("quality");
   const tCat = useTranslations("categories");
@@ -281,6 +288,15 @@ export default function CreatePage() {
   const mockFlowTimersRef = useRef<number[]>([]);
   /** `/vs/create?demo=1`: flujo sin wallet ni contrato (no compatible con rematch). */
   const isCreateDemoSession = isCreateDemoUrl && rematchId === null;
+  const createTrustlineGate = evaluateUsdcTrustlineGate({
+    action: rematchId === null ? "create" : "rematch",
+    status: trustline.status,
+    loading: trustline.loading,
+    stale: trustline.stale,
+    isConnected,
+    hasSigner: Boolean(signer),
+  });
+  const createTrustlineBlocked = !isCreateDemoSession && !createTrustlineGate.allowed;
   const ticketWalletAddress =
     isCreateDemoSession && !address ? MOCK_DEMO_CREATOR_ADDRESS : address;
   /** Evita mismatch de hidratación: fechas relativas y `min` del input dependen de zona horaria y del reloj del cliente. */
@@ -1114,6 +1130,11 @@ export default function CreatePage() {
       return;
     }
 
+    if (!isDemoCreate && !createTrustlineGate.allowed) {
+      toast.error(tWallet(createTrustlineGate.messageKey));
+      return;
+    }
+
     const {
       question: parsedQuestion,
       creatorPosition: parsedCreatorPos,
@@ -1157,6 +1178,11 @@ export default function CreatePage() {
       if (!moderationOk) {
         return;
       }
+    }
+
+    if (!isDemoCreate && !createTrustlineGate.allowed) {
+      toast.error(tWallet(createTrustlineGate.messageKey));
+      return;
     }
 
     let releaseLock: (() => void) | undefined;
@@ -2414,6 +2440,9 @@ export default function CreatePage() {
                     </div>
                   </div>
                 ) : null}
+                {!isCreateDemoSession && isConnected && (
+                  <UsdcTrustlineGate trustline={trustline} className="mb-3" />
+                )}
                 <div className={CREATE_DESKTOP_CTA_WRAP_CLASS}>
                 {isConnected || isCreateDemoSession ? (
                   <Button
@@ -2424,7 +2453,7 @@ export default function CreatePage() {
                       mockOverlayPhase === "loading" ||
                       moderationLoading
                     }
-                    disabled={isFormMockBusy || moderationLoading}
+                    disabled={isFormMockBusy || moderationLoading || createTrustlineBlocked}
                     className="rounded-2xl py-5 font-display text-sm font-bold uppercase tracking-widest"
                   >
                     {mockOverlayPhase === "loading" || loading ? (
@@ -2470,7 +2499,7 @@ export default function CreatePage() {
                   mockOverlayPhase === "loading" ||
                   moderationLoading
                 }
-                disabled={isFormMockBusy || moderationLoading}
+                disabled={isFormMockBusy || moderationLoading || createTrustlineBlocked}
                 className="min-h-[44px] rounded-2xl py-4 font-display text-sm font-bold uppercase tracking-widest"
               >
                 {mockOverlayPhase === "loading" || loading ? (

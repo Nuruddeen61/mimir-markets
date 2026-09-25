@@ -50,6 +50,35 @@ Source: `contracts-soroban/mimir-market/src/fees.rs`, mirrored off-chain in
   behaviour: the contract asserts escrow moved by exactly the requested amount and
   errors with `UnsupportedToken` otherwise.
 
+### Principal-safe payout preview
+
+The stake form shows what the contract will pay, not the pre-fee pool formula.
+`previewChallengerPayoutSafe` (`lib/payout.ts`) takes the gross from
+`challengerPayoutUnits`, splits it with the claim's own `getClaimFees` snapshot in
+`principalSafePayout`, and returns `netPayout`. Tests:
+`tests/node/payout-preview.test.ts`.
+
+- Fees are charged on profit only, so `netPayout >= principal` in every market.
+  The clamp inside `principalSafePayout` is the backstop for a snapshot that was
+  never valid; `isPrincipalSafe` is the shared assertion the UI and tests use.
+- A snapshot the contract could not have written (negative, non-integer, or above
+  `MAX_TOTAL_FEE_BPS` when the two legs are summed) is classified `invalid` and NOT
+  applied. Any unread snapshot (`loading` / `unavailable` / `invalid`) previews the
+  gross and the UI labels it — an unknown fee can only make the real payout lower,
+  so the gross is a ceiling, never a promise.
+- The preview is address-independent: `fees.rs::quote_fees` charges an agent-owner
+  leg whenever the claim has a recipient and does not waive it by earner (that
+  waiver belongs to the off-chain `splitAttributedFees`, not to settlement). A
+  disconnected viewer therefore sees the same net as the challenger; connection
+  only gates the stake action.
+
+Rollout: no contract change and no data migration. The snapshot is immutable per
+claim, so the read cannot go stale while a page is open — it happens once per
+claim id, and a failed read degrades to the labelled gross. Analytics keeps its
+established gross meaning for `total_return_multiple` and gains a `fee_adjusted`
+marker, so the fee-adjusted and fee-unknown cases stay distinguishable without
+renaming an event or an envelope field.
+
 ### Settlement conservation
 
 `conservation_holds_across_every_verdict` asserts, for every `WinnerSide`, that
@@ -62,6 +91,26 @@ payouts + fees + dust equals escrow inflow. Alongside it:
 - `fixed_odds_with_several_challengers_conserves_exactly`
 - `draw_refunds_everyone_in_full_with_no_fee` and the `Unresolvable` equivalent
 - `a_quote_matches_what_the_pull_actually_pays`
+
+### Fixed-odds liquidity is a claim-level accounting invariant
+
+A fixed-odds challenge reserves only the challenger's **profit**, because the
+challenger's principal is already held in escrow and is returned on every
+outcome. The contract computes the same integer profit as `gross_payout` at
+challenge time, rejects a challenge when it exceeds the creator's unreserved
+stake, and stores the cumulative reservation on the claim. A failed check runs
+before the token pull and leaves claim state, escrow, and participant balances
+unchanged. Exact-capacity and exhausted-capacity cases are covered by
+`fixed_odds_rejects_challenge_creator_cannot_cover`; corrupt reservations fail
+closed via `fixed_odds_rejects_corrupt_reserved_liability_without_underflowing`.
+
+At resolution, the reserved profit is paid to winning challengers, while the
+creator receives the unreserved remainder. The `FixedOddsLiquidityReserved`
+event records the post-challenge reservation and remaining liquidity, making the
+limit auditable from ledger events without trusting a read-index. The
+`checked_*` arithmetic used for inflow, committed payout, and claim counters
+also prevents malformed persisted state from wrapping into an apparently valid
+settlement.
 
 The off-chain mirror exports `conservationHolds` and `noWinnerLosesPrincipal` from
 `lib/fees.ts` and asserts them over the same shapes.

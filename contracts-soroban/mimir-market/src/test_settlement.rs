@@ -7,7 +7,7 @@
 
 extern crate std;
 
-use soroban_sdk::{Address, String};
+use soroban_sdk::{testutils::Events as _, Address, Event, String};
 
 use crate::test_common::{Fixture, USDC};
 use crate::types::{Error, WinnerSide, CHALLENGE_LOCK_SECONDS};
@@ -184,6 +184,21 @@ fn fixed_odds_challenger_win_refunds_unspent_liability_without_fee() {
 
     // 3 USDC at 2x → gross 6, profit 3 reserved against the creator's 10.
     f.client().challenge_claim(&c1, &id, &(3 * USDC), &None);
+    let expected_liquidity_event = crate::events::FixedOddsLiquidityReserved {
+        id,
+        challenger: c1.clone(),
+        stake: 3 * USDC,
+        gross: 6 * USDC,
+        profit: 3 * USDC,
+        reserved_creator_liability: 3 * USDC,
+        available_creator_liquidity: 7 * USDC,
+    }
+    .to_xdr(&f.env, &f.contract_id);
+    let emitted_events = f.env.events().all();
+    assert!(emitted_events
+        .events()
+        .iter()
+        .any(|event| event == &expected_liquidity_event));
     assert_eq!(
         f.client().get_claim_market_config(&id).challenger_payout_bps,
         20_000
@@ -293,14 +308,55 @@ fn fixed_odds_rejects_challenge_creator_cannot_cover() {
         f.client().get_claim(&id).reserved_creator_liability,
         10 * USDC
     );
-    // A second challenger now has no liquidity left.
+    // A second challenger now has no liquidity left. The failed check must
+    // happen before the token pull, and must leave the claim and both balances
+    // untouched.
     let c2 = f.user(100 * USDC);
+    let c2_before = f.token().balance(&c2);
+    let escrow_before = f.escrow_balance();
+    let claim_before = f.client().get_claim(&id);
     let err = f
         .client()
         .try_challenge_claim(&c2, &id, &(2 * USDC), &None)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, Error::InsufficientCreatorLiquidity);
+    assert_eq!(f.token().balance(&c2), c2_before);
+    assert_eq!(f.escrow_balance(), escrow_before);
+    assert_eq!(f.client().get_claim(&id), claim_before);
+}
+
+#[test]
+fn fixed_odds_rejects_corrupt_reserved_liability_without_underflowing() {
+    let f = Fixture::new(0, 0);
+    let creator = f.user(100 * USDC);
+    let challenger = f.user(100 * USDC);
+    let mut params = f.params(10 * USDC);
+    params.odds_mode = f.str("fixed");
+    params.challenger_payout_bps = 20_000;
+    let id = f.client().create_claim(&creator, &params);
+
+    // Model a legacy/malformed row. The contract must fail closed rather than
+    // calculate a negative available balance or wrap under release overflow
+    // checks.
+    let mut claim = f.client().get_claim(&id);
+    claim.reserved_creator_liability = claim.creator_stake + 1;
+    f.env.as_contract(&f.contract_id, || {
+        crate::storage::set_claim(&f.env, id, &claim);
+    });
+
+    let err = f
+        .client()
+        .try_challenge_claim(&challenger, &id, &(2 * USDC), &None)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InsufficientCreatorLiquidity);
+    assert_eq!(
+        f.client().get_claim(&id).reserved_creator_liability,
+        claim.creator_stake + 1
+    );
+    assert_eq!(f.token().balance(&challenger), 100 * USDC);
+    assert_eq!(f.escrow_balance(), 10 * USDC);
 }
 
 // ── DRAW / UNRESOLVABLE ──────────────────────────────────────────────────────
@@ -707,7 +763,29 @@ fn an_unchallenged_claim_cannot_be_resolved() {
 }
 
 #[test]
-fn resolving_twice_is_rejected() {
+fn resolving_twice_with_same_inputs_is_idempotent() {
+    let f = Fixture::new(0, 0);
+    let creator = f.user(100 * USDC);
+    let c1 = f.user(100 * USDC);
+    let id = f.client().create_claim(&creator, &f.params(5 * USDC));
+    f.client().challenge_claim(&c1, &id, &(5 * USDC), &None);
+    f.advance_by(3_600);
+
+    // First call succeeds.
+    f.client()
+        .resolve_claim(&id, &WinnerSide::Draw, &f.str("a"), &1, &f.zero_hash());
+    
+    // Second call with exact same inputs succeeds without modifying state.
+    f.client()
+        .resolve_claim(&id, &WinnerSide::Draw, &f.str("a"), &1, &f.zero_hash());
+
+    let claim = f.client().get_claim(&id);
+    assert_eq!(claim.state, crate::types::ClaimState::Resolved);
+    assert_eq!(claim.winner_side, WinnerSide::Draw);
+}
+
+#[test]
+fn resolving_twice_with_different_inputs_is_rejected() {
     let f = Fixture::new(0, 0);
     let creator = f.user(100 * USDC);
     let c1 = f.user(100 * USDC);
@@ -719,7 +797,7 @@ fn resolving_twice_is_rejected() {
         .resolve_claim(&id, &WinnerSide::Draw, &f.str("a"), &1, &f.zero_hash());
     let err = f
         .client()
-        .try_resolve_claim(&id, &WinnerSide::Creator, &f.str("b"), &1, &f.zero_hash())
+        .try_resolve_claim(&id, &WinnerSide::Creator, &f.str("a"), &1, &f.zero_hash())
         .unwrap_err()
         .unwrap();
     assert_eq!(err, Error::ClaimNotActive);

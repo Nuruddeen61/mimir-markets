@@ -20,17 +20,20 @@
 
 import { lookup } from "node:dns/promises";
 import { sha256Hex } from "@/lib/content-hash";
+import { isPaused } from "@/lib/ops/flags";
 import {
   checkDomainPolicy,
   checkRedirectHopPolicy,
   checkResolvedAddresses,
   checkUrl,
+  composeDomainPolicy,
+  domainPolicyDiagnostics,
   domainPolicyFromEnv,
   sanitizeHeadersForRedirect,
   type DomainPolicy,
   type SsrfReason,
 } from "./ssrf";
-import { recordSourceFailure } from "./telemetry";
+import { recordAllowlistReject, recordSourceFailure } from "./telemetry";
 
 export const MAX_REDIRECTS = 3;
 export const MAX_RESPONSE_BYTES = 512 * 1024;
@@ -290,12 +293,18 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
     return { ok: false, ...failure };
   };
   const envPolicy = domainPolicyFromEnv();
-  const policy: DomainPolicy = {
-    ...envPolicy,
-    ...(args.policy ?? {}),
-    ...(args.allowCrossDomainRedirects !== undefined ? { allowCrossDomainRedirects: args.allowCrossDomainRedirects } : {}),
-    ...(args.allowProtocolDowngrade !== undefined ? { disallowProtocolDowngrade: !args.allowProtocolDowngrade } : {}),
-  };
+  const policyDiagnostics = domainPolicyDiagnostics();
+  // The operator's configuration is authoritative: a request-scoped policy may
+  // narrow it but never widen it. Before this, `policy: { allow: [] }` on a
+  // fetch cleared the operator allowlist and admitted the whole internet.
+  const policy: DomainPolicy = composeDomainPolicy(envPolicy, args.policy);
+  // Request-level redirect switches may only tighten, never loosen.
+  if (args.allowCrossDomainRedirects !== undefined) {
+    policy.allowCrossDomainRedirects = (policy.allowCrossDomainRedirects ?? true) && args.allowCrossDomainRedirects;
+  }
+  if (args.allowProtocolDowngrade !== undefined) {
+    policy.disallowProtocolDowngrade = (policy.disallowProtocolDowngrade ?? true) || args.allowProtocolDowngrade === false;
+  }
   const budget = args.budget ?? defaultAgentBudget();
   const doFetch = args.fetchImpl ?? fetch;
 
@@ -303,8 +312,31 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
     return fail({ kind: "cancelled", detail: "request was cancelled" });
   }
 
+  // A configured-but-unusable allowlist is a configuration error, not license to
+  // fetch anything. Refuse, and make the reason countable in telemetry.
+  if (policyDiagnostics.allowConfigured && envPolicy.allow.length === 0 && !policy.denyAll) {
+    recordAllowlistReject("pattern_invalid");
+    return fail({
+      kind: "blocked",
+      reason: "not_allowlisted",
+      detail: `RESEARCH_ALLOWED_DOMAINS has no usable entries (${policyDiagnostics.allowInvalid.length} invalid); refusing all research fetches`,
+    });
+  }
+  // Strict mode is the recommended production posture: opt in with
+  // RESEARCH_REQUIRE_ALLOWLIST=1 so "no allowlist configured" is a refusal rather
+  // than an open gateway. Opt-in, so existing deployments keep working.
+  const requireAllowlist = ["1", "true"].includes((process.env.RESEARCH_REQUIRE_ALLOWLIST ?? "").toLowerCase());
+  if (requireAllowlist && policy.allow.length === 0 && !policy.denyAll) {
+    recordAllowlistReject("allowlist_unconfigured");
+    return fail({
+      kind: "blocked",
+      reason: "not_allowlisted",
+      detail: "RESEARCH_REQUIRE_ALLOWLIST=1 but neither RESEARCH_ALLOWED_DOMAINS nor a request allowlist is set",
+    });
+  }
+
   const pausedAgents = new Set((process.env.RESEARCH_PAUSED_AGENT_IDS ?? "").split(",").map((id) => id.trim().toLowerCase()).filter(Boolean));
-  if (process.env.MIMIR_PAUSE_RESEARCH === "1" || pausedAgents.has(args.agentId.trim().toLowerCase())) {
+  if (isPaused("research") || pausedAgents.has(args.agentId.trim().toLowerCase())) {
     return fail({ kind: "paused", detail: `research is paused for agent '${args.agentId}'` });
   }
 
@@ -337,9 +369,17 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
     ...(args.headers ?? {}),
   };
 
+  // Callers can only lower the redirect ceiling, never raise it past the
+  // operator's policy.
+  const requestedMaxRedirects = [args.maxRedirects, policy.maxRedirects].filter(
+    (value): value is number => typeof value === "number",
+  );
   const effectiveMaxRedirects = Math.max(
     0,
-    Math.min(args.maxRedirects ?? policy.maxRedirects ?? MAX_REDIRECTS, 10),
+    Math.min(
+      requestedMaxRedirects.length > 0 ? Math.min(...requestedMaxRedirects) : MAX_REDIRECTS,
+      10,
+    ),
   );
 
   for (;;) {
@@ -351,6 +391,9 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
     if (!hop.allowed) {
       if (hop.reason === "protocol_downgrade") {
         return fail({ kind: "protocol_downgrade", detail: hop.detail });
+      }
+      if (hop.reason === "not_allowlisted") {
+        recordAllowlistReject("not_allowlisted");
       }
       return fail({ kind: "blocked", reason: hop.reason, detail: hop.detail });
     }
@@ -399,6 +442,9 @@ export async function gatewayFetch(args: GatewayFetchArgs): Promise<FetchResult>
       if (!redirectHopVerdict.allowed) {
         if (redirectHopVerdict.reason === "protocol_downgrade") {
           return fail({ kind: "protocol_downgrade", detail: redirectHopVerdict.detail ?? "insecure protocol downgrade" });
+        }
+        if (redirectHopVerdict.reason === "not_allowlisted") {
+          recordAllowlistReject("not_allowlisted");
         }
         return fail({ kind: "blocked", reason: redirectHopVerdict.reason!, detail: redirectHopVerdict.detail! });
       }

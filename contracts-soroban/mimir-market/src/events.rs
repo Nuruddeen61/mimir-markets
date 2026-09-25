@@ -24,6 +24,24 @@ pub struct ClaimChallenged {
     pub stake: i128,
 }
 
+/// A fixed-odds challenge consumed part of the creator's liquidity guarantee.
+/// `reserved_creator_liability` and `available_creator_liquidity` are snapshots
+/// after this challenge, so an indexer can audit the limit without replaying
+/// the roster or trusting a stale read-index calculation.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixedOddsLiquidityReserved {
+    #[topic]
+    pub id: u64,
+    #[topic]
+    pub challenger: Address,
+    pub stake: i128,
+    pub gross: i128,
+    pub profit: i128,
+    pub reserved_creator_liability: i128,
+    pub available_creator_liquidity: i128,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimResolved {
@@ -33,6 +51,21 @@ pub struct ClaimResolved {
     pub summary: String,
     pub confidence: u32,
     pub evidence_hash: BytesN<32>,
+}
+
+/// The versioned verdict written at resolution, emitted alongside
+/// `ClaimResolved`.
+///
+/// `ClaimResolved` keeps its existing shape for compatible indexers; this event
+/// carries the explicit encoding version so consumers can pin the verdict
+/// encoding without a second read or a schema guess.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerdictEncoded {
+    #[topic]
+    pub id: u64,
+    pub version: u32,
+    pub winner_side: WinnerSide,
 }
 
 /// The creator's refund of an unchallenged claim. `refund` lets an indexer

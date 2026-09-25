@@ -507,7 +507,24 @@ fn only_the_oracle_can_resolve() {
 }
 
 #[test]
-fn resolving_twice_is_rejected() {
+fn resolving_twice_with_same_inputs_is_idempotent() {
+    let f = Fixture::new();
+    let captain = f.user(0);
+    let a1 = f.user(100 * USDC);
+    let id = f.market(&captain, 0);
+    f.client().deposit(&a1, &id, &SIDE_A, &(10 * USDC));
+    f.advance_by(DEFAULT_DURATION);
+
+    f.client().resolve(&id, &SIDE_A);
+    f.client().resolve(&id, &SIDE_A); // Should not error
+
+    let m = f.client().get_market(&id);
+    assert!(m.resolved);
+    assert_eq!(m.result, SIDE_A);
+}
+
+#[test]
+fn resolving_twice_with_different_inputs_is_rejected() {
     let f = Fixture::new();
     let captain = f.user(0);
     let a1 = f.user(100 * USDC);
@@ -627,7 +644,7 @@ fn transition_deadline_works_for_underfunded() {
 }
 
 #[test]
-fn transition_deadline_rejected_if_funded() {
+fn transition_deadline_preserves_active_state_to_extend_ttl() {
     let f = Fixture::new();
     let captain = f.user(0);
     let a1 = f.user(100 * USDC);
@@ -638,7 +655,8 @@ fn transition_deadline_rejected_if_funded() {
 
     f.advance_by(DEFAULT_DURATION);
     
-    // Both sides funded, cannot transition
-    let err = f.client().try_transition_deadline(&id).unwrap_err().unwrap();
-    assert_eq!(err, Error::Locked);
+    // Both sides funded, should succeed to persist TTL bumps without resolving
+    f.client().transition_deadline(&id);
+    let m = f.client().get_market(&id);
+    assert!(!m.resolved);
 }

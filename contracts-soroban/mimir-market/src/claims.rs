@@ -185,19 +185,39 @@ pub fn challenge_claim(
         return Err(Error::DuelNeedsEqualStake);
     }
 
+    let mut fixed_odds_gross = 0;
+    let mut fixed_odds_profit = 0;
     if util::is_fixed_odds(env, &claim.market.odds_mode) {
-        let gross = fees::gross_payout(stake_amount, claim.market.challenger_payout_bps)?;
-        let profit = if gross > stake_amount {
-            gross - stake_amount
+        fixed_odds_gross = fees::gross_payout(stake_amount, claim.market.challenger_payout_bps)?;
+        fixed_odds_profit = if fixed_odds_gross > stake_amount {
+            fixed_odds_gross - stake_amount
         } else {
             0
         };
-        let available = claim.creator_stake - claim.reserved_creator_liability;
-        if available < profit {
+        // Treat a corrupt/legacy claim with more liability than principal as
+        // underfunded rather than allowing a negative "available" balance or a
+        // wrapping subtraction in the release build.
+        let available = claim
+            .creator_stake
+            .checked_sub(claim.reserved_creator_liability)
+            .ok_or(Error::InsufficientCreatorLiquidity)?;
+        if available < fixed_odds_profit {
             return Err(Error::InsufficientCreatorLiquidity);
         }
-        claim.reserved_creator_liability += profit;
+        claim.reserved_creator_liability = claim
+            .reserved_creator_liability
+            .checked_add(fixed_odds_profit)
+            .ok_or(Error::Overflow)?;
     }
+
+    let next_total_challenger_stake = claim
+        .total_challenger_stake
+        .checked_add(stake_amount)
+        .ok_or(Error::Overflow)?;
+    let next_challenger_count = claim
+        .challenger_count
+        .checked_add(1)
+        .ok_or(Error::Overflow)?;
 
     let usdc = storage::usdc(env)?;
     escrow::pull(env, &usdc, &challenger, stake_amount)?;
@@ -209,10 +229,26 @@ pub fn challenge_claim(
     });
     storage::set_challengers(env, claim_id, &list);
 
-    claim.total_challenger_stake += stake_amount;
-    claim.challenger_count += 1;
+    claim.total_challenger_stake = next_total_challenger_stake;
+    claim.challenger_count = next_challenger_count;
     claim.state = ClaimState::Active;
     storage::set_claim(env, claim_id, &claim);
+
+    if util::is_fixed_odds(env, &claim.market.odds_mode) {
+        events::FixedOddsLiquidityReserved {
+            id: claim_id,
+            challenger: challenger.clone(),
+            stake: stake_amount,
+            gross: fixed_odds_gross,
+            profit: fixed_odds_profit,
+            reserved_creator_liability: claim.reserved_creator_liability,
+            available_creator_liquidity: claim
+                .creator_stake
+                .checked_sub(claim.reserved_creator_liability)
+                .ok_or(Error::InsufficientCreatorLiquidity)?,
+        }
+        .publish(env);
+    }
 
     events::ClaimChallenged {
         id: claim_id,
@@ -226,6 +262,9 @@ pub fn challenge_claim(
 
 pub fn transition_deadline(env: &Env, claim_id: u64) -> Result<(), Error> {
     let mut claim = storage::get_claim(env, claim_id)?;
+    if claim.state == ClaimState::Active {
+        return Ok(());
+    }
     if claim.state != ClaimState::Open {
         return Err(Error::ClaimNotOpen);
     }
@@ -238,7 +277,9 @@ pub fn transition_deadline(env: &Env, claim_id: u64) -> Result<(), Error> {
     let refund = claim.creator_stake;
     storage::set_claim(env, claim_id, &claim);
 
-    // Cancellation is a refund: no fee.
+    // Cancellation is a refund: no fee. Same parked-flag semantics as
+    // `cancel_claim` below: report the DELTA, because the creator may already
+    // hold a parked balance from an earlier settlement that is not this refund.
     let usdc = storage::usdc(env)?;
     let pending_before = storage::withdrawable(env, &creator);
     escrow::push_or_park(env, &usdc, &creator, refund);
@@ -255,6 +296,9 @@ pub fn transition_deadline(env: &Env, claim_id: u64) -> Result<(), Error> {
 pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
     let mut claim = storage::get_claim(env, claim_id)?;
     claim.creator.require_auth();
+    if claim.state == ClaimState::Cancelled {
+        return Ok(());
+    }
     if claim.state != ClaimState::Open {
         return Err(Error::ClaimNotOpen);
     }
