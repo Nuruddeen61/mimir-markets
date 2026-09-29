@@ -636,7 +636,8 @@ async function challengeIfMispriced(claim: ClaimOnChain): Promise<void> {
     );
     return;
   }
-  const preGate = , CHALLENGE_STAKE_USDC);
+
+  const preGate = riskManager.canChallenge(claim, CHALLENGE_STAKE_USDC);
   if (!preGate.ok) {
     console.log(`[risk] skip claim #${claim.id}: ${preGate.reason}`);
     return;
@@ -650,12 +651,12 @@ async function challengeIfMispriced(claim: ClaimOnChain): Promise<void> {
 
   // Short-circuit: with no real evidence the LLM will return UNRESOLVABLE,
   // which never satisfies the CHALLENGERS_WIN/≥80% bar below. Skip the
-  // wasted LLM call — savriskManager.canChallenge(claimes a Gemini RPM slot per dead-evidence claim.
+  // wasted LLM call — saves a Gemini RPM slot per dead-evidence claim.
   if (evidence.fetcher === "none") {
     console.log(`[challenge] Skipping LLM — no evidence available (fetcher=none)`);
     return;
   }
- 
+
   const rawVerdict = await evaluateClaim(claim, evidence.text);
   const verdict = applyFetcherTrust(rawVerdict, evidence.fetcher);
 
@@ -672,7 +673,7 @@ async function challengeIfMispriced(claim: ClaimOnChain): Promise<void> {
   // conversion here — the sizing arithmetic itself is unchanged.
   const kelly = kellyFraction(verdict.confidence, KELLY_CAP);
   const bankroll = balances.usdc;
-  const kellyStake = Math.max(CHALLENGE_STAKE_USDC, Math.min(bankr kelly, bankroll * 0.1));
+  const kellyStake = Math.max(CHALLENGE_STAKE_USDC, Math.min(bankroll * kelly, bankroll * 0.1));
   const stakeUsdc = Math.round(kellyStake * 100) / 100;
 
   const gate = riskManager.canChallenge(claim, stakeUsdc);
